@@ -59,7 +59,6 @@ const MAX_CHUNK_SURFACE: u32 = (MASK_WIDTH * MASK_WIDTH) as u32;
 const CHUNK_BATCH_SIZE: usize = 2048;
 const CSV_HEADER: &str = "block-position;chunk-position;blockSize;chunkSize";
 const PROGRESS_REFRESH_MS: u64 = 350;
-const PROGRESS_BAR_WIDTH: usize = 40;
 
 fn main() -> Result<()> {
     let args = CliArgs::parse()?;
@@ -974,16 +973,20 @@ fn format_progress_line(total: u64, completed: u64, matches: u64, start: Instant
     } else {
         Duration::from_secs(0)
     };
-    let bar = progress_bar(progress);
+    let speed = if elapsed.as_secs_f64() > 0.0 {
+        completed as f64 / elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
     let remaining_str = if completed > 0 {
         format_duration(remaining)
     } else {
         "--:--:--".to_string()
     };
     format!(
-        "{} {:>6.2}% | 匹配 matches: {} | 进度 progress: {}/{} | 已用 elapsed: {} | 剩余 remaining: {}",
-        bar,
+        "{:>6.2}% | 速度 speed: {:>10.2} pos/s | 匹配 matches: {} | 进度 progress: {}/{} | 已用 elapsed: {} | 剩余 remaining: {}",
         progress * 100.0,
+        speed,
         matches,
         completed,
         total,
@@ -998,14 +1001,6 @@ fn format_duration(duration: Duration) -> String {
     let mins = (secs % 3600) / 60;
     let seconds = secs % 60;
     format!("{:02}:{:02}:{:02}", hours, mins, seconds)
-}
-
-fn progress_bar(progress: f64) -> String {
-    let clamped = progress.clamp(0.0, 1.0);
-    let filled = (clamped * PROGRESS_BAR_WIDTH as f64).floor() as usize;
-    let filled = filled.min(PROGRESS_BAR_WIDTH);
-    let empty = PROGRESS_BAR_WIDTH - filled;
-    format!("[{}{}]", "#".repeat(filled), ".".repeat(empty))
 }
 
 struct JavaRandom {
