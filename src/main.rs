@@ -59,6 +59,7 @@ const MAX_CHUNK_SURFACE: u32 = (MASK_WIDTH * MASK_WIDTH) as u32;
 const CHUNK_BATCH_SIZE: usize = 2048;
 const CSV_HEADER: &str = "block-position;chunk-position;blockSize;chunkSize";
 const PROGRESS_REFRESH_MS: u64 = 350;
+const RESULT_FLUSH_THRESHOLD: usize = 1_024_000;
 
 fn main() -> Result<()> {
     let args = CliArgs::parse()?;
@@ -156,6 +157,7 @@ fn run_search(config: &AppConfig, config_path: &Path) -> Result<()> {
     let mut result_writer = ResultWriter::new(&output_path, config.search.append)?;
     let mut total_matches_written = 0usize;
     let mut extrema = Aggregation::default();
+    let mut pending_matches = Vec::with_capacity(RESULT_FLUSH_THRESHOLD.min(1024));
 
     // 分批生成任务，避免在巨大范围内一次性分配全部坐标。
     // Batch the jobs so extremely wide searches do not allocate enormous vectors.
@@ -215,8 +217,12 @@ fn run_search(config: &AppConfig, config_path: &Path) -> Result<()> {
                 b.in_block.z,
             ))
         });
-        result_writer.write_batch(&batch.matches)?;
-        total_matches_written += batch.matches.len();
+        pending_matches.append(&mut batch.matches);
+        if pending_matches.len() >= RESULT_FLUSH_THRESHOLD {
+            result_writer.write_batch(&pending_matches)?;
+            total_matches_written += pending_matches.len();
+            pending_matches.clear();
+        }
         extrema.absorb_extrema(&batch);
         if processed_chunks >= chunk_total {
             break;
@@ -226,6 +232,11 @@ fn run_search(config: &AppConfig, config_path: &Path) -> Result<()> {
     done.store(true, Ordering::Relaxed);
     let _ = progress_handle.join();
 
+    if !pending_matches.is_empty() {
+        result_writer.write_batch(&pending_matches)?;
+        total_matches_written += pending_matches.len();
+        pending_matches.clear();
+    }
     result_writer.flush()?;
     println!(
         "已写入匹配结果 / Matches written: {} → {}",
