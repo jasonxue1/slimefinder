@@ -152,9 +152,14 @@ fn run_search(config: &AppConfig, config_path: &Path) -> Result<()> {
         })
     };
 
+    let output_path = resolve_output_path(config_path, &config.search.output_file);
+    let mut result_writer = ResultWriter::new(&output_path, config.search.append)?;
+    let mut total_matches_written = 0usize;
+    let mut extrema = Aggregation::default();
+
     // 分批生成任务，避免在巨大范围内一次性分配全部坐标。
     // Batch the jobs so extremely wide searches do not allocate enormous vectors.
-    let mut aggregation = Aggregation::default();
+    let mut processed_chunks = 0u64;
     let mut chunk_batch = Vec::with_capacity(CHUNK_BATCH_SIZE);
     let mut job_batch = Vec::with_capacity(CHUNK_BATCH_SIZE * in_points.len());
     loop {
@@ -162,6 +167,17 @@ fn run_search(config: &AppConfig, config_path: &Path) -> Result<()> {
         if chunk_batch.is_empty() {
             break;
         }
+        let remaining_chunks = chunk_total.saturating_sub(processed_chunks);
+        if remaining_chunks == 0 {
+            break;
+        }
+        if chunk_batch.len() as u64 > remaining_chunks {
+            chunk_batch.truncate(remaining_chunks as usize);
+        }
+        if chunk_batch.is_empty() {
+            break;
+        }
+        processed_chunks += chunk_batch.len() as u64;
         job_batch.clear();
         for chunk in &chunk_batch {
             for in_point in &in_points {
@@ -172,7 +188,7 @@ fn run_search(config: &AppConfig, config_path: &Path) -> Result<()> {
             }
         }
 
-        let batch = job_batch
+        let mut batch = job_batch
             .par_iter()
             .fold(
                 || Aggregation::default(),
@@ -191,26 +207,29 @@ fn run_search(config: &AppConfig, config_path: &Path) -> Result<()> {
                 },
             )
             .reduce(Aggregation::default, Aggregation::merge);
-        aggregation = Aggregation::merge(aggregation, batch);
+        batch.matches.sort_by(|a, b| {
+            (a.chunk.x, a.chunk.z, a.in_block.x, a.in_block.z).cmp(&(
+                b.chunk.x,
+                b.chunk.z,
+                b.in_block.x,
+                b.in_block.z,
+            ))
+        });
+        result_writer.write_batch(&batch.matches)?;
+        total_matches_written += batch.matches.len();
+        extrema.absorb_extrema(&batch);
+        if processed_chunks >= chunk_total {
+            break;
+        }
     }
 
     done.store(true, Ordering::Relaxed);
     let _ = progress_handle.join();
 
-    let mut matches = aggregation.matches;
-    matches.sort_by(|a, b| {
-        (a.chunk.x, a.chunk.z, a.in_block.x, a.in_block.z).cmp(&(
-            b.chunk.x,
-            b.chunk.z,
-            b.in_block.x,
-            b.in_block.z,
-        ))
-    });
-    let output_path = resolve_output_path(config_path, &config.search.output_file);
-    write_results(&matches, &output_path, config.search.append)?;
+    result_writer.flush()?;
     println!(
         "已写入匹配结果 / Matches written: {} → {}",
-        matches.len(),
+        total_matches_written,
         output_path.display()
     );
 
@@ -220,7 +239,7 @@ fn run_search(config: &AppConfig, config_path: &Path) -> Result<()> {
         println!("平均耗时 / Avg ns per position: {}", nanos_per);
     }
 
-    if let Some(min_block) = aggregation.min_block {
+    if let Some(min_block) = extrema.min_block {
         println!(
             "最小 block / Smallest block cluster: {} @ {} ({})",
             min_block.block_ratio(),
@@ -228,7 +247,7 @@ fn run_search(config: &AppConfig, config_path: &Path) -> Result<()> {
             min_block.block_string()
         );
     }
-    if let Some(max_block) = aggregation.max_block {
+    if let Some(max_block) = extrema.max_block {
         println!(
             "最大 block / Largest block cluster: {} @ {} ({})",
             max_block.block_ratio(),
@@ -236,7 +255,7 @@ fn run_search(config: &AppConfig, config_path: &Path) -> Result<()> {
             max_block.block_string()
         );
     }
-    if let Some(min_chunk) = aggregation.min_chunk {
+    if let Some(min_chunk) = extrema.min_chunk {
         println!(
             "最小 chunk / Smallest chunk cluster: {} @ {} ({})",
             min_chunk.chunk_ratio(),
@@ -244,7 +263,7 @@ fn run_search(config: &AppConfig, config_path: &Path) -> Result<()> {
             min_chunk.block_string()
         );
     }
-    if let Some(max_chunk) = aggregation.max_chunk {
+    if let Some(max_chunk) = extrema.max_chunk {
         println!(
             "最大 chunk / Largest chunk cluster: {} @ {} ({})",
             max_chunk.chunk_ratio(),
@@ -725,6 +744,29 @@ impl Aggregation {
         });
         self
     }
+
+    fn absorb_extrema(&mut self, other: &Aggregation) {
+        if let Some(ref candidate) = other.max_block {
+            update_slot(&mut self.max_block, candidate.clone(), |cand, curr| {
+                cand.block_size > curr.block_size
+            });
+        }
+        if let Some(ref candidate) = other.min_block {
+            update_slot(&mut self.min_block, candidate.clone(), |cand, curr| {
+                cand.block_size < curr.block_size
+            });
+        }
+        if let Some(ref candidate) = other.max_chunk {
+            update_slot(&mut self.max_chunk, candidate.clone(), |cand, curr| {
+                cand.chunk_size > curr.chunk_size
+            });
+        }
+        if let Some(ref candidate) = other.min_chunk {
+            update_slot(&mut self.min_chunk, candidate.clone(), |cand, curr| {
+                cand.chunk_size < curr.chunk_size
+            });
+        }
+    }
 }
 
 fn update_slot<F>(slot: &mut Option<MaskData>, data: MaskData, better: F)
@@ -920,56 +962,80 @@ fn resolve_output_path(config_path: &Path, output: &str) -> PathBuf {
     }
 }
 
-fn write_results(matches: &[MaskData], path: &Path, append: bool) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("无法创建目录 / Failed to create {}", parent.display()))?;
+struct ResultWriter {
+    path: PathBuf,
+    writer: BufWriter<std::fs::File>,
+}
+
+impl ResultWriter {
+    fn new(path: &Path, append: bool) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("无法创建目录 / Failed to create {}", parent.display())
+                })?;
+            }
         }
-    }
-    let need_header = if append {
-        fs::metadata(path)
-            .map(|meta| meta.len() == 0)
-            .unwrap_or(true)
-    } else {
-        true
-    };
-    let file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .append(append)
-        .truncate(!append)
-        .open(path)
-        .with_context(|| format!("无法打开结果文件 / Failed to open {}", path.display()))?;
-    let mut writer = BufWriter::new(file);
-    if need_header {
-        writeln!(writer, "{}", CSV_HEADER)?;
-    }
-    for data in matches {
-        writeln!(
+        let need_header = if append {
+            fs::metadata(path)
+                .map(|meta| meta.len() == 0)
+                .unwrap_or(true)
+        } else {
+            true
+        };
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(append)
+            .truncate(!append)
+            .open(path)
+            .with_context(|| format!("无法打开结果文件 / Failed to open {}", path.display()))?;
+        let mut writer = BufWriter::new(file);
+        if need_header {
+            writeln!(writer, "{}", CSV_HEADER)?;
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
             writer,
-            "{};{};{}/{};{}/{}",
-            data.block_string(),
-            data.chunk_string(),
-            data.block_size,
-            data.block_surface_area,
-            data.chunk_size,
-            data.chunk_surface_area
-        )?;
+        })
     }
-    writer.flush()?;
-    Ok(())
+
+    fn write_batch(&mut self, matches: &[MaskData]) -> Result<()> {
+        for data in matches {
+            writeln!(
+                self.writer,
+                "{};{};{}/{};{}/{}",
+                data.block_string(),
+                data.chunk_string(),
+                data.block_size,
+                data.block_surface_area,
+                data.chunk_size,
+                data.chunk_surface_area
+            )?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.writer.flush().with_context(|| {
+            format!(
+                "无法刷新结果文件 / Failed to flush {}",
+                self.path.display()
+            )
+        })
+    }
 }
 
 fn format_progress_line(total: u64, completed: u64, matches: u64, start: Instant) -> String {
     if total == 0 {
         return "尚未开始 / No work scheduled".to_string();
     }
-    let progress = completed as f64 / total as f64;
+    let capped_completed = completed.min(total);
+    let progress = capped_completed as f64 / total as f64;
     let elapsed = start.elapsed();
     let remaining = if completed > 0 {
         let secs_per = elapsed.as_secs_f64() / completed as f64;
-        Duration::from_secs_f64((total - completed) as f64 * secs_per)
+        Duration::from_secs_f64(total.saturating_sub(completed) as f64 * secs_per)
     } else {
         Duration::from_secs(0)
     };
@@ -988,7 +1054,7 @@ fn format_progress_line(total: u64, completed: u64, matches: u64, start: Instant
         progress * 100.0,
         speed,
         matches,
-        completed,
+        capped_completed,
         total,
         format_duration(elapsed),
         remaining_str
