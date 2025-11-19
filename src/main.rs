@@ -1044,15 +1044,20 @@ impl JavaRandom {
 }
 
 fn is_slime_chunk(seed: i64, chunk_x: i32, chunk_z: i32) -> bool {
-    let chunk_x = chunk_x as i64;
-    let chunk_z = chunk_z as i64;
-    let mut random = JavaRandom::new(
-        (seed
-            + chunk_x * chunk_x * 4987142
-            + chunk_x * 5947611
-            + chunk_z * chunk_z * 4392871
-            + chunk_z * 389711)
-            ^ 987_234_911,
-    );
+    // The Java implementation performs these multiplications in 32-bit ints and then
+    // casts to long, so we replicate that overflow behaviour explicitly.
+    let chunk_x_sq = chunk_x.wrapping_mul(chunk_x);
+    let chunk_z_sq = chunk_z.wrapping_mul(chunk_z);
+    let term_x_sq = i64::from(chunk_x_sq.wrapping_mul(4_987_142));
+    let term_x = i64::from(chunk_x.wrapping_mul(5_947_611));
+    let term_z_sq = i64::from(chunk_z_sq).wrapping_mul(4_392_871_i64);
+    let term_z = i64::from(chunk_z.wrapping_mul(389_711));
+    let mixed_seed = seed
+        .wrapping_add(term_x_sq)
+        .wrapping_add(term_x)
+        .wrapping_add(term_z_sq)
+        .wrapping_add(term_z)
+        ^ 987_234_911_i64;
+    let mut random = JavaRandom::new(mixed_seed);
     random.next_int(10) == 0
 }
