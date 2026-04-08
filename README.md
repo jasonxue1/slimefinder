@@ -19,7 +19,7 @@ cargo run --release -- --config slimefinder.toml
 
 ## 配置格式 / Configuration
 
-`[mask]` 定义世界种子、是否启用消失/排除球体、玩家高度偏移以及区块权重。  
+`[mask]` 定义世界种子、是否启用消失/排除球体、玩家高度偏移上限（程序会遍历 `0..=max_y_offset`）以及区块权重。  
 `[search]` 定义搜索中心、内外方形宽度、是否遍历 256 个方块、块/区块数量阈值，以及 `results.csv` 输出位置。
 
 示例配置存放在 `Slimefinder/slimefinder.toml`，与程序自动生成的默认值一致。
@@ -28,7 +28,7 @@ cargo run --release -- --config slimefinder.toml
 
 - `cargo run --release -- --config slimefinder.toml`：执行搜索。
 - `cargo fmt` / `cargo clippy`：格式化或静态检查（可选）。
-- 输出 CSV 含 `block-position;chunk-position;blockSize;chunkSize` 列，使用 `;` 作为分隔符。
+- 输出 CSV 含 `block-position;chunk-position;yOffset;blockSize;chunkSize` 列，使用 `;` 作为分隔符。
 
 ## 目录 / Layout
 

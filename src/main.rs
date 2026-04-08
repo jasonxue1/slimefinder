@@ -23,8 +23,8 @@ world_seed = 0
 despawn_sphere = true
 # 是否启用玩家安全区 / Enable player exclusion sphere
 exclusion_sphere = true
-# 玩家 Y 轴相对高度 / Player Y-offset
-y_offset = 0
+# 玩家 Y 轴相对高度最大值（将遍历 0..=该值）/ Max player Y-offset (iterate 0..=value)
+max_y_offset = 0
 # 判断区块在遮罩内所需的最少方块数 / Minimum block weight per chunk
 chunk_weight = 0
 
@@ -57,7 +57,7 @@ const MAX_BLOCK_SURFACE: u32 =
     (MASK_WIDTH * MASK_WIDTH * BLOCKS_PER_CHUNK_USIZE * BLOCKS_PER_CHUNK_USIZE) as u32;
 const MAX_CHUNK_SURFACE: u32 = (MASK_WIDTH * MASK_WIDTH) as u32;
 const CHUNK_BATCH_SIZE: usize = 2048;
-const CSV_HEADER: &str = "block-position;chunk-position;blockSize;chunkSize";
+const CSV_HEADER: &str = "block-position;chunk-position;yOffset;blockSize;chunkSize";
 const PROGRESS_REFRESH_MS: u64 = 350;
 const RESULT_FLUSH_THRESHOLD: usize = 1_024_000;
 
@@ -100,7 +100,8 @@ fn run_search(config: &AppConfig, config_path: &Path) -> Result<()> {
         return Ok(());
     }
     let in_points = build_in_points(&config.search);
-    let total = chunk_total * in_points.len() as u64;
+    let y_offsets = build_y_offsets(&config.mask);
+    let total = chunk_total * in_points.len() as u64 * y_offsets.len() as u64;
     if total == 0 {
         println!("未创建任何任务 / No jobs were scheduled.");
         return Ok(());
@@ -117,9 +118,17 @@ fn run_search(config: &AppConfig, config_path: &Path) -> Result<()> {
         "结果文件 / Output file: {} (append={})",
         config.search.output_file, config.search.append
     );
+    println!(
+        "Y 偏移遍历 / Y-offset sweep: 0..={}",
+        config.mask.max_y_offset
+    );
 
     let mask_cfg = Arc::new(config.mask.clone());
-    let template_cache = Arc::new(build_template_cache(&in_points, mask_cfg.as_ref()));
+    let template_cache = Arc::new(build_template_cache(
+        &in_points,
+        mask_cfg.as_ref(),
+        &y_offsets,
+    ));
     let bounds = Arc::new(SearchBounds::from(&config.search));
     let matches_counter = Arc::new(AtomicU64::new(0));
     let completed = Arc::new(AtomicU64::new(0));
@@ -163,7 +172,7 @@ fn run_search(config: &AppConfig, config_path: &Path) -> Result<()> {
     // Batch the jobs so extremely wide searches do not allocate enormous vectors.
     let mut processed_chunks = 0u64;
     let mut chunk_batch = Vec::with_capacity(CHUNK_BATCH_SIZE);
-    let mut job_batch = Vec::with_capacity(CHUNK_BATCH_SIZE * in_points.len());
+    let mut job_batch = Vec::with_capacity(CHUNK_BATCH_SIZE * in_points.len() * y_offsets.len());
     loop {
         fill_chunk_batch(&mut path, &mut chunk_batch, CHUNK_BATCH_SIZE);
         if chunk_batch.is_empty() {
@@ -183,10 +192,13 @@ fn run_search(config: &AppConfig, config_path: &Path) -> Result<()> {
         job_batch.clear();
         for chunk in &chunk_batch {
             for in_point in &in_points {
-                job_batch.push(MaskJob {
-                    chunk: *chunk,
-                    in_block: *in_point,
-                });
+                for &y_offset in &y_offsets {
+                    job_batch.push(MaskJob {
+                        chunk: *chunk,
+                        in_block: *in_point,
+                        y_offset,
+                    });
+                }
             }
         }
 
@@ -196,7 +208,7 @@ fn run_search(config: &AppConfig, config_path: &Path) -> Result<()> {
                 || Aggregation::default(),
                 |mut agg, job| {
                     let template = template_cache
-                        .get(&job.in_block)
+                        .get(&(job.in_block, job.y_offset))
                         .expect("missing precomputed mask template");
                     let data = compute_mask(mask_cfg.as_ref(), template, job);
                     let is_match = bounds.matches(&data);
@@ -210,11 +222,12 @@ fn run_search(config: &AppConfig, config_path: &Path) -> Result<()> {
             )
             .reduce(Aggregation::default, Aggregation::merge);
         batch.matches.sort_by(|a, b| {
-            (a.chunk.x, a.chunk.z, a.in_block.x, a.in_block.z).cmp(&(
+            (a.chunk.x, a.chunk.z, a.in_block.x, a.in_block.z, a.y_offset).cmp(&(
                 b.chunk.x,
                 b.chunk.z,
                 b.in_block.x,
                 b.in_block.z,
+                b.y_offset,
             ))
         });
         pending_matches.append(&mut batch.matches);
@@ -252,34 +265,38 @@ fn run_search(config: &AppConfig, config_path: &Path) -> Result<()> {
 
     if let Some(min_block) = extrema.min_block {
         println!(
-            "最小 block / Smallest block cluster: {} @ {} ({})",
+            "最小 block / Smallest block cluster: {} @ {} ({}; y={})",
             min_block.block_ratio(),
             min_block.chunk_string(),
-            min_block.block_string()
+            min_block.block_string(),
+            min_block.y_offset
         );
     }
     if let Some(max_block) = extrema.max_block {
         println!(
-            "最大 block / Largest block cluster: {} @ {} ({})",
+            "最大 block / Largest block cluster: {} @ {} ({}; y={})",
             max_block.block_ratio(),
             max_block.chunk_string(),
-            max_block.block_string()
+            max_block.block_string(),
+            max_block.y_offset
         );
     }
     if let Some(min_chunk) = extrema.min_chunk {
         println!(
-            "最小 chunk / Smallest chunk cluster: {} @ {} ({})",
+            "最小 chunk / Smallest chunk cluster: {} @ {} ({}; y={})",
             min_chunk.chunk_ratio(),
             min_chunk.chunk_string(),
-            min_chunk.block_string()
+            min_chunk.block_string(),
+            min_chunk.y_offset
         );
     }
     if let Some(max_chunk) = extrema.max_chunk {
         println!(
-            "最大 chunk / Largest chunk cluster: {} @ {} ({})",
+            "最大 chunk / Largest chunk cluster: {} @ {} ({}; y={})",
             max_chunk.chunk_ratio(),
             max_chunk.chunk_string(),
-            max_chunk.block_string()
+            max_chunk.block_string(),
+            max_chunk.y_offset
         );
     }
     Ok(())
@@ -353,7 +370,8 @@ struct MaskConfig {
     world_seed: i64,
     despawn_sphere: bool,
     exclusion_sphere: bool,
-    y_offset: i32,
+    #[serde(default, alias = "y_offset")]
+    max_y_offset: u32,
     chunk_weight: u32,
 }
 
@@ -363,7 +381,7 @@ impl Default for MaskConfig {
             world_seed: 0,
             despawn_sphere: true,
             exclusion_sphere: true,
-            y_offset: 0,
+            max_y_offset: 0,
             chunk_weight: 0,
         }
     }
@@ -544,8 +562,8 @@ struct MaskGeometry {
 }
 
 impl MaskGeometry {
-    fn from_config(cfg: &MaskConfig) -> Self {
-        let y = cfg.y_offset as i64;
+    fn from_y_offset(y_offset: u32) -> Self {
+        let y = i64::from(y_offset);
         let y_sq = y * y;
         let exclusion_limit = 24_i64 * 24_i64;
         let r_exclusion_sq = exclusion_limit - y_sq.min(exclusion_limit);
@@ -557,12 +575,18 @@ impl MaskGeometry {
     }
 }
 
-fn build_template_cache(points: &[Point], cfg: &MaskConfig) -> HashMap<Point, MaskTemplate> {
-    let geometry = MaskGeometry::from_config(cfg);
+fn build_template_cache(
+    points: &[Point],
+    cfg: &MaskConfig,
+    y_offsets: &[u32],
+) -> HashMap<(Point, u32), MaskTemplate> {
     let mut map = HashMap::new();
-    for point in points {
-        map.entry(*point)
-            .or_insert_with(|| build_template(cfg, &geometry, *point));
+    for &y_offset in y_offsets {
+        let geometry = MaskGeometry::from_y_offset(y_offset);
+        for point in points {
+            map.entry((*point, y_offset))
+                .or_insert_with(|| build_template(cfg, &geometry, *point));
+        }
     }
     map
 }
@@ -620,6 +644,7 @@ fn is_block_inside(
 struct MaskJob {
     chunk: Point,
     in_block: Point,
+    y_offset: u32,
 }
 
 fn build_in_points(cfg: &SearchConfig) -> Vec<Point> {
@@ -634,6 +659,10 @@ fn build_in_points(cfg: &SearchConfig) -> Vec<Point> {
     } else {
         vec![cfg.center_pos.in_block]
     }
+}
+
+fn build_y_offsets(cfg: &MaskConfig) -> Vec<u32> {
+    (0..=cfg.max_y_offset).collect()
 }
 
 fn fill_chunk_batch(path: &mut SearchPath, buffer: &mut Vec<Point>, limit: usize) {
@@ -667,6 +696,7 @@ fn compute_mask(cfg: &MaskConfig, template: &MaskTemplate, job: &MaskJob) -> Mas
     MaskData {
         chunk: job.chunk,
         in_block: job.in_block,
+        y_offset: job.y_offset,
         block_surface_area: template.block_surface_area,
         chunk_surface_area: template.chunk_surface_area,
         block_size,
@@ -678,6 +708,7 @@ fn compute_mask(cfg: &MaskConfig, template: &MaskTemplate, job: &MaskJob) -> Mas
 struct MaskData {
     chunk: Point,
     in_block: Point,
+    y_offset: u32,
     block_surface_area: u32,
     chunk_surface_area: u32,
     block_size: u32,
@@ -1015,9 +1046,10 @@ impl ResultWriter {
         for data in matches {
             writeln!(
                 self.writer,
-                "{};{};{}/{};{}/{}",
+                "{};{};{};{}/{};{}/{}",
                 data.block_string(),
                 data.chunk_string(),
+                data.y_offset,
                 data.block_size,
                 data.block_surface_area,
                 data.chunk_size,
@@ -1028,12 +1060,9 @@ impl ResultWriter {
     }
 
     fn flush(&mut self) -> Result<()> {
-        self.writer.flush().with_context(|| {
-            format!(
-                "无法刷新结果文件 / Failed to flush {}",
-                self.path.display()
-            )
-        })
+        self.writer
+            .flush()
+            .with_context(|| format!("无法刷新结果文件 / Failed to flush {}", self.path.display()))
     }
 }
 

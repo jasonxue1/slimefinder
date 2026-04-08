@@ -31,7 +31,7 @@ cargo run --release -- --config slimefinder.toml
 | `world_seed` | i64 | `0` | 世界种子 / Minecraft world seed |
 | `despawn_sphere` | bool | `true` | 是否应用 128m 自动消失球体 / Enable 128m despawn sphere |
 | `exclusion_sphere` | bool | `true` | 是否应用 24m 安全球体 / Enable 24m exclusion sphere |
-| `y_offset` | i32 | `0` | 相对玩家 Y 偏移，影响两个球体的半径投影 / Player-relative Y offset |
+| `max_y_offset` | u32 | `0` | 玩家 Y 偏移上限；程序会遍历 `0..=max_y_offset` / Max player-relative Y offset |
 | `chunk_weight` | u32 | `0` | 判断区块属于遮罩所需的最少方块数 / Minimum block weight to mark a chunk inside |
 
 **块遮罩 / Block mask**  
@@ -61,7 +61,8 @@ The chunk mask counts a chunk if the number of inside blocks exceeds `chunk_weig
 
 **搜索范围 / Search Area**  
 程序以 `center_pos` 为起点，按照螺旋路径遍历 `max_width² - min_width²` 个区块。  
-With fine search disabled，只会在每个区块内评估一个方块（即 `center_pos` 的 within-chunk 位置）；启用 fine search 则对所有 256 个 within-chunk 坐标进行评估。
+With fine search disabled，只会在每个区块内评估一个方块（即 `center_pos` 的 within-chunk 位置）；启用 fine search 则对所有 256 个 within-chunk 坐标进行评估。  
+每个坐标还会遍历 `yOffset = 0..=max_y_offset`。
 
 **匹配条件 / Match Criteria**  
 当某个位置的 `block_size` 处于 `[min_block_size, max_block_size]` 或 `chunk_size` 处于 `[min_chunk_size, max_chunk_size]` 时，就会被视为匹配并写入文件。  
@@ -72,12 +73,13 @@ Only one of the ranges needs to match for a position to be recorded.
 默认 CSV 结构如下：
 
 ```
-block-position;chunk-position;blockSize;chunkSize
-0,0;0c0,0c0;4005/49640;18/222
+block-position;chunk-position;yOffset;blockSize;chunkSize
+0,0;0c0,0c0;0;4005/49640;18/222
 ```
 
 - `block-position`：方块坐标（x,z）  
 - `chunk-position`：`Xcx,Zcz` 格式  
+- `yOffset`：本条结果使用的 Y 偏移  
 - `blockSize`：`匹配块数/总块面积`（例如 `4005/49640`）  
 - `chunkSize`：`匹配区块数/总区块面积`
 
@@ -92,7 +94,7 @@ block-position;chunk-position;blockSize;chunkSize
 world_seed = 123456789
 despawn_sphere = true
 exclusion_sphere = true
-y_offset = 0
+max_y_offset = 0
 chunk_weight = 50
 
 [search]
@@ -114,6 +116,8 @@ append = false
   Rayon automatically saturates available CPU cores.
 - `fine_search = true` 会将任务数量乘以 256，适合对小范围进行深度扫描。  
   Use fine search only when refining promising regions.
+- `max_y_offset = N` 会再将任务数量乘以 `N+1`（因为遍历 `0..=N`）。  
+  Sweeping Y-offsets multiplies job count by `N + 1`.
 - 设置较大的 `max_width` 时，建议确保搜索机子的内存和 CPU 充足。  
   Large max widths produce millions of jobs; be mindful of available resources.
 
